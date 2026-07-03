@@ -164,15 +164,25 @@
         { id: "eleven_multilingual_v2", label: "Multilingual v2 — best prosody, slower" },
       ],
     },
+    // Speaker roster confirmed directly from Sarvam's own 400-error response body
+    // (the previous list — anushka/manisha/vidya/arya/abhilash/karun/hitesh — was
+    // guessed and doesn't exist for bulbul:v3, so every Sarvam TTS call was failing
+    // and silently falling back to the microservice on every single turn).
     sarvam: {
       voices: [
-        { id: "anushka", label: "Anushka (F, v3)" }, { id: "manisha", label: "Manisha (F, v3)" },
-        { id: "vidya", label: "Vidya (F, v3)" }, { id: "arya", label: "Arya (F, v3)" },
-        { id: "abhilash", label: "Abhilash (M, v3)" }, { id: "karun", label: "Karun (M, v3)" },
-        { id: "hitesh", label: "Hitesh (M, v3)" },
-        { id: "ritu", label: "Ritu (F, legacy hi)" }, { id: "priya", label: "Priya (F, legacy en)" },
-        { id: "rahul", label: "Rahul (M, legacy hi)" }, { id: "roopa", label: "Roopa (F, legacy mr)" },
-        { id: "anand", label: "Anand (M, legacy mr)" },
+        { id: "ritu",    label: "Ritu (F)" },    { id: "priya",   label: "Priya (F)" },
+        { id: "neha",    label: "Neha (F)" },    { id: "pooja",   label: "Pooja (F)" },
+        { id: "simran",  label: "Simran (F)" },  { id: "kavya",   label: "Kavya (F)" },
+        { id: "ishita",  label: "Ishita (F)" },  { id: "shreya",  label: "Shreya (F)" },
+        { id: "roopa",   label: "Roopa (F)" },   { id: "tanya",   label: "Tanya (F)" },
+        { id: "aditya",  label: "Aditya (M)" },  { id: "ashutosh",label: "Ashutosh (M)" },
+        { id: "rahul",   label: "Rahul (M)" },   { id: "rohan",   label: "Rohan (M)" },
+        { id: "amit",    label: "Amit (M)" },    { id: "dev",     label: "Dev (M)" },
+        { id: "varun",   label: "Varun (M)" },   { id: "manan",   label: "Manan (M)" },
+        { id: "sumit",   label: "Sumit (M)" },   { id: "kabir",   label: "Kabir (M)" },
+        { id: "aayan",   label: "Aayan (M)" },   { id: "shubh",   label: "Shubh (M)" },
+        { id: "advait",  label: "Advait (M)" },  { id: "anand",   label: "Anand (M)" },
+        { id: "tarun",   label: "Tarun (M)" },   { id: "ratan",   label: "Ratan (M)" },
         { id: "__custom__", label: "Custom speaker…" },
       ],
       models: [
