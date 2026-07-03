@@ -2109,6 +2109,10 @@ function normalizeTtsText(text) {
 async function synthesizeSpeechSarvam(text, voiceId, lang, modelOverride = null) {
   const sarvamKey = process.env.SARVAM_API_KEY;
   if (!sarvamKey) return null;
+  if (ttsSarvamBreaker.onCooldown()) {
+    console.warn(`[tts-sarvam] on cooldown (${ttsSarvamBreaker.reason()}) — skipping call`);
+    return null;
+  }
   const langCode = SARVAM_LANG_MAP[lang] || "hi-IN";
   const speaker = voiceId || "meera";
   const model = modelOverride || process.env.SARVAM_TTS_MODEL || "bulbul:v3";
@@ -2140,8 +2144,17 @@ async function synthesizeSpeechSarvam(text, voiceId, lang, modelOverride = null)
     console.log(`[tts-sarvam] latency=${Date.now()-t0}ms speaker=${speaker} lang=${langCode}`);
     return Buffer.from(audios[0], "base64");
   } catch (err) {
+    const status = err.response?.status;
     const body = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : "";
     console.warn(`[tts-sarvam] failed (${Date.now()-t0}ms): ${err.message}${body ? " body=" + body : ""}`);
+    // Same reasoning as the microservice breaker: 429 (rate limit) or 402 (no
+    // credits) will not succeed on immediate retry, and hammering Sarvam on
+    // every filler/greeting/reply across every session was the actual cause
+    // of "Sarvam not working" — a self-inflicted retry storm, not Sarvam
+    // being down. 401/403 covered too in case the key itself is invalid.
+    if (status === 429 || status === 402 || status === 401 || status === 403) {
+      ttsSarvamBreaker.trip(status);
+    }
     return null;
   }
 }
@@ -2193,25 +2206,34 @@ async function synthesizeSpeechGemini(text, voiceName, emotion) {
   }
 }
 
-// ── Circuit breaker for the TTS microservice fallback ────────────────────────
+// ── Circuit breaker factory for TTS providers ────────────────────────────────
 // Module-level (not per-session) because the underlying cause — a bad API key
-// or an exhausted account-wide rate limit — affects every concurrent call, not
-// just one. Without this, a single misconfigured credential caused every
-// filler/greeting/nudge/goodbye call across every active session to keep
-// retrying a guaranteed-to-fail endpoint with zero backoff.
-let ttsMicroserviceCooldownUntil  = 0;
-let ttsMicroserviceCooldownReason = "";
-function ttsMicroserviceOnCooldown() {
-  return Date.now() < ttsMicroserviceCooldownUntil;
+// or an exhausted/rate-limited account — affects every concurrent call, not
+// just one. Without this, a single misconfigured credential or a rate-limited
+// account caused every filler/greeting/nudge/goodbye/reply call across every
+// active session to keep retrying a guaranteed-to-fail endpoint with zero
+// backoff — seen in production as hundreds of failed requests per second and
+// turns taking a minute-plus to complete.
+function createTtsCircuitBreaker(label) {
+  let cooldownUntil = 0;
+  let cooldownReason = "";
+  return {
+    onCooldown() { return Date.now() < cooldownUntil; },
+    reason() { return cooldownReason; },
+    trip(status) {
+      // 401/403 = the credential itself is wrong — won't self-heal, cool down
+      // longer. 429/402 = rate limit or exhausted credits — usually clears
+      // sooner (RPS caps reset in seconds; monthly credit resets are longer,
+      // but we can't tell from the response, so use the same short cooldown).
+      const cooldownMs = (status === 401 || status === 403) ? 120000 : 15000;
+      cooldownUntil  = Date.now() + cooldownMs;
+      cooldownReason = `HTTP ${status}`;
+      console.warn(`[tts] ${label} circuit breaker OPEN for ${cooldownMs}ms (reason: HTTP ${status}) — skipping ${label} calls until cooldown expires`);
+    },
+  };
 }
-function tripTtsMicroserviceCircuitBreaker(status) {
-  // 401/403 = the credential itself is wrong — won't self-heal, so cool down
-  // longer. 429 = rate limit, likely to reset soon — shorter cooldown.
-  const cooldownMs = (status === 401 || status === 403) ? 120000 : 15000;
-  ttsMicroserviceCooldownUntil  = Date.now() + cooldownMs;
-  ttsMicroserviceCooldownReason = `HTTP ${status}`;
-  console.warn(`[tts] circuit breaker OPEN for ${cooldownMs}ms (reason: HTTP ${status}) — skipping microservice fallback calls until cooldown expires`);
-}
+const ttsMicroserviceBreaker = createTtsCircuitBreaker("microservice");
+const ttsSarvamBreaker       = createTtsCircuitBreaker("sarvam");
 
 async function synthesizeSpeech(session, text) {
   const normalizedText = normalizeTtsText(text);
@@ -2263,8 +2285,8 @@ async function synthesizeSpeech(session, text) {
   }
 
   // ── Microservice fallback (handles ElevenLabs or local TTS) ──────────────
-  if (ttsMicroserviceOnCooldown()) {
-    console.warn(`[tts] microservice on cooldown (${ttsMicroserviceCooldownReason}) — skipping call callSid=${session.callSid}`);
+  if (ttsMicroserviceBreaker.onCooldown()) {
+    console.warn(`[tts] microservice on cooldown (${ttsMicroserviceBreaker.reason()}) — skipping call callSid=${session.callSid}`);
     return null;
   }
   try {
@@ -2292,13 +2314,13 @@ async function synthesizeSpeech(session, text) {
       message: error.message,
       status,
     });
-    // 401/403 = the credential is wrong and will NOT self-heal on retry; 429 = rate
-    // limited. Retrying either on every single filler/greeting/nudge call across
-    // every session (as before) hammered a guaranteed-to-fail endpoint hundreds of
-    // times per second and stalled real turns for a minute-plus. Trip a cooldown
-    // so subsequent calls fail fast instead of piling up.
-    if (status === 401 || status === 403 || status === 429) {
-      tripTtsMicroserviceCircuitBreaker(status);
+    // 401/403 = the credential is wrong and will NOT self-heal on retry; 429/402 =
+    // rate limited or out of credits. Retrying any of these on every single
+    // filler/greeting/nudge call across every session (as before) hammered a
+    // guaranteed-to-fail endpoint hundreds of times per second and stalled real
+    // turns for a minute-plus. Trip a cooldown so subsequent calls fail fast.
+    if (status === 401 || status === 403 || status === 429 || status === 402) {
+      ttsMicroserviceBreaker.trip(status);
     }
     return null;
   }
@@ -3473,6 +3495,10 @@ async function streamingLLMWithLocalTTS(ws, session, userText) {
 async function processCallerUtterance(ws, session, callSid, reason = "utterance") {
   const inbound = session.inboundAudio;
   if (!inbound || inbound.processing || !inbound.chunks.length || session.telephony?.hangupScheduled) return;
+  // A fresh, VAD-triggered utterance (as opposed to one auto-chained from the
+  // finally-block below) means real progress is happening — reset the runaway
+  // guard so a brief noisy patch doesn't permanently suppress future turns.
+  if (reason !== "queued-after-processing") session._consecutiveRequeues = 0;
   inbound.processing = true;
   const utteranceAudio = Buffer.concat(inbound.chunks);
   inbound.chunks = [];
@@ -3842,14 +3868,33 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
       currentInbound.processing = false;
       currentInbound.lastFlushAt = Date.now();
       const queuedBytes = currentInbound.chunks.reduce((s, c) => s + c.length, 0);
-      if (queuedBytes > MIN_UTTERANCE_BYTES && ws.readyState === WebSocket.OPEN && !session.closed) {
+      // Sanity cap on immediate self-requeue. Without this, continuous background
+      // noise (or a pipeline that keeps failing fast, e.g. once a TTS circuit
+      // breaker is tripped) can retrigger processCallerUtterance via setImmediate
+      // indefinitely — each cycle firing its own STT+LLM+TTS calls with essentially
+      // no delay between them. This combined with a failing TTS provider is what
+      // produced hundreds of requests per second in production. Cap consecutive
+      // immediate requeues; beyond that, drop the queued audio and wait for a
+      // fresh VAD-detected utterance instead of chaining forever.
+      const MAX_CONSECUTIVE_REQUEUES = 5;
+      session._consecutiveRequeues = session._consecutiveRequeues || 0;
+      if (
+        queuedBytes > MIN_UTTERANCE_BYTES && ws.readyState === WebSocket.OPEN && !session.closed
+        && session._consecutiveRequeues < MAX_CONSECUTIVE_REQUEUES
+      ) {
+        session._consecutiveRequeues++;
         setImmediate(() => {
           processCallerUtterance(ws, session, callSid, "queued-after-processing").catch((error) =>
             console.warn("[enablex-media] queued utterance failed", { callSid, message: error.message })
           );
         });
-      } else if (currentInbound.chunks.length) {
-        // Discard tiny queued fragments — they're noise from the agent's playback period
+      } else {
+        if (session._consecutiveRequeues >= MAX_CONSECUTIVE_REQUEUES) {
+          console.warn(`[enablex-media] hit max consecutive requeues (${MAX_CONSECUTIVE_REQUEUES}) — dropping queued audio callSid=${callSid}`);
+        }
+        session._consecutiveRequeues = 0;
+        // Discard queued fragments — they're either noise from the agent's playback
+        // period, or we've hit the runaway cap above.
         currentInbound.chunks = [];
         currentInbound.speechFrames = 0;
         currentInbound.silenceFrames = 0;
