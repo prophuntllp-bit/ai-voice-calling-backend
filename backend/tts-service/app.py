@@ -191,15 +191,15 @@ def _preprocess_tts_text(text: str, language: str) -> str:
 # speed      : 0.75 = slow/thoughtful          |  1.25 = fast/energetic
 _EMOTION_VOICE_SETTINGS: dict[str, dict] = {
     # Opening greeting — warm, friendly, inviting
-    "warm":         {"stability": 0.35, "style": 0.25, "speed": 0.95},
+    "warm":         {"stability": 0.40, "style": 0.45, "speed": 1.02},
     # Talking about features/amenities/offers — upbeat, enthusiastic
-    "excited":      {"stability": 0.20, "style": 0.50, "speed": 1.05},
+    "excited":      {"stability": 0.28, "style": 0.65, "speed": 1.08},
     # Handling price concerns — gentle, patient, reassuring
-    "empathetic":   {"stability": 0.60, "style": 0.10, "speed": 0.90},
+    "empathetic":   {"stability": 0.55, "style": 0.30, "speed": 0.95},
     # Booking site visit / scheduling — clear, confident, professional
-    "professional": {"stability": 0.70, "style": 0.05, "speed": 1.00},
+    "professional": {"stability": 0.50, "style": 0.25, "speed": 1.00},
     # Default fallback
-    "neutral":      {"stability": 0.50, "style": 0.00, "speed": 1.00},
+    "neutral":      {"stability": 0.45, "style": 0.35, "speed": 1.00},
 }
 
 

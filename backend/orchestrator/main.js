@@ -718,14 +718,13 @@ YOU ARE NOT A SCRIPT-READER. You are a person having a real conversation.
 8. A LITTLE HUMOR GOES A LONG WAY — A light remark makes you memorable.
    "Dus lakh mein Pune West mein... haan, thoda mushkil hai — but chalein, dekhte hain kya nikalta hai!" (warm, not dismissive)
 
-9. VARY YOUR OPENINGS — Don't start every response the same way. Mix it up:
-   "Haan bilkul" / "Achha" / "Samjha" / "Dekhiye" / "Arrey wah" / "Sahi baat" / just answer directly sometimes.
+9. MOST RESPONSES START DIRECTLY WITH THE ANSWER — no filler word, no "Haan/Achha/Hmm" preamble. Just answer.
+   A real person doesn't open every sentence with a verbal tic — only a bot does that.
 
-10. START WITH A THINKING SOUND — Begin every response with a very brief filler that buys you a half-second to think. This is how real humans talk — it feels natural and keeps the conversation alive.
-    Hindi/Hinglish: "Haan..." / "Achha..." / "Hmm..." / "Dekhiye..." / "Bilkul..."
-    English: "Sure..." / "Right..." / "Okay..." / "Well..." / "Mm-hmm..."
-    Marathi: "Haan..." / "Bghaa..." / "Achha..."
-    Keep it to ONE word followed by a pause (use "..."). Don't chain multiple fillers. This single sound makes you feel present and thinking — not robotic.
+10. FILLERS ARE RARE, NOT A HABIT — use a short reaction like "Arrey wah" / "Achha" / "Samjha" / "Dekhiye"
+    at most once every 4-5 turns, ONLY when something genuinely surprising or noteworthy was just said
+    (e.g. they revealed a big budget, or a real objection). NEVER use one two turns in a row.
+    NEVER start with "Haan" or "Accha" as a default habit — vary it, or skip it entirely most of the time.
 
 ━━━ WHAT YOU'RE TRYING TO FIND OUT — weave naturally into conversation ━━━
 1. Purpose — investment ya khud rehne ke liye?
@@ -1767,6 +1766,27 @@ async function getOpeningMessage(session) {
   return opening;
 }
 
+// ── Content-based echo detection ─────────────────────────────────────────────
+// Old approach dropped EVERY transcript that arrived inside a fixed time window
+// after the agent finished speaking (up to 5s for a long reply). Real callers
+// often respond within a few hundred ms of the agent finishing — well within
+// that window — so genuine speech was being silently discarded ("doesn't pick
+// up what I'm saying", "words are cut"). Instead of trusting the clock alone,
+// compare what was actually transcribed against what the agent just said: if
+// most of the transcript's words appear in the agent's last line, it's almost
+// certainly the agent's own voice reflecting back down the phone line — real
+// replies essentially never restate the agent's sentence back to it.
+function isLikelyEcho(transcriptText, session) {
+  const lastAgentMsg = [...(session.history || [])].reverse().find(h => h.role === "assistant");
+  if (!lastAgentMsg?.content) return false;
+  const norm = (s) => s.toLowerCase().replace(/[.,!?।…"'\-]/g, " ").trim();
+  const agentWords = new Set(norm(lastAgentMsg.content).split(/\s+/).filter(w => w.length > 2));
+  const transWords = norm(transcriptText).split(/\s+/).filter(w => w.length > 2);
+  if (!transWords.length || agentWords.size < 2) return false;
+  const overlap = transWords.filter(w => agentWords.has(w)).length;
+  return (overlap / transWords.length) >= 0.6;
+}
+
 function emotionFromContext(text = "", state = {}) {
   const lowered = text.toLowerCase();
   if (state.stage === "opening") return "warm";
@@ -2555,7 +2575,10 @@ function encodePcm16ToMuLaw(pcm8kBuffer) {
 
 function toEnablexMuLawChunks(ttsWavBuffer) {
   const { pcm, sampleRate } = parseWavInfo(ttsWavBuffer);
-  const pcm8k = sampleRate === 16000 ? downsamplePcm16To8k(pcm) : resamplePcm16(pcm, sampleRate, 8000);
+  // Always use the anti-aliased FIR resampler — downsamplePcm16To8k did naive 2:1
+  // decimation with no low-pass filter, aliasing high frequencies back into the
+  // audio band as crackle/static ("radio" sound). resamplePcm16 filters first.
+  const pcm8k = resamplePcm16(pcm, sampleRate, 8000);
   const muLaw = encodePcm16ToMuLaw(pcm8k);
   const chunks = [];
   for (let offset = 0; offset < muLaw.length; offset += 160) {
@@ -2835,14 +2858,17 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
 
   // Emotion → voice settings
   const emotion = emotionFromContext(userText, { stage: session.stage });
-  // Monika Sogam (Calm and Natural) — multilingual_v2 settings matched from ElevenLabs Studio:
-  // stability ~0.95 (very stable, calm), similarity 1.0, style ~0.15 (low exaggeration), speed ~0.85 (slightly slow).
+  // stability near 1.0 = ElevenLabs' "flat/monotone" mode — it actively SUPPRESSES
+  // expressiveness. Previous values (0.88-0.95) made every emotion sound nearly
+  // identical and robotic regardless of which one was picked. Real conversational
+  // range lives around 0.3-0.55 stability with meaningful style separation between
+  // emotions. speed kept close to 1.0 — the old 0.82-0.90 made the voice drawl.
   const ESETTINGS = {
-    warm:         { stability: 0.92, similarity_boost: 1.0, style: 0.18, speed: 0.85 },
-    excited:      { stability: 0.88, similarity_boost: 1.0, style: 0.22, speed: 0.90 },
-    empathetic:   { stability: 0.95, similarity_boost: 1.0, style: 0.12, speed: 0.82 },
-    professional: { stability: 0.95, similarity_boost: 1.0, style: 0.10, speed: 0.87 },
-    neutral:      { stability: 0.93, similarity_boost: 1.0, style: 0.15, speed: 0.85 },
+    warm:         { stability: 0.40, similarity_boost: 1.0, style: 0.45, speed: 1.02 },
+    excited:      { stability: 0.28, similarity_boost: 1.0, style: 0.65, speed: 1.08 },
+    empathetic:   { stability: 0.55, similarity_boost: 1.0, style: 0.30, speed: 0.95 },
+    professional: { stability: 0.50, similarity_boost: 1.0, style: 0.25, speed: 1.00 },
+    neutral:      { stability: 0.45, similarity_boost: 1.0, style: 0.35, speed: 1.00 },
   };
   const voiceSettings = ESETTINGS[emotion] || ESETTINGS.neutral;
 
@@ -2974,7 +3000,7 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
       } catch {}
     });
 
-    elevenWs.on("close", () => {
+    elevenWs.on("close", async () => {
       if (mulawQueue) mulawQueue.close();
       fireOnFirstAudio(); // ensure lock released even if no audio arrived
       const reply = fullText.trim();
@@ -2984,7 +3010,30 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
       session.history.push({ role: "assistant", content: reply });
       const m = reply.match(/OUTCOME:({.*})/s);
       if (m) { try { session.outcome = JSON.parse(m[1]); } catch {} }
-      console.log(`[eleven-stream] done TTFA=${Date.now()-t0}ms reply="${clean.slice(0,60)}" callSid=${callSid}`);
+      console.log(`[eleven-stream] done TTFA=${Date.now()-t0}ms reply="${clean.slice(0,60)}" callSid=${callSid} audioFired=${audioFired}`);
+
+      // ── BUG FIX: silent turns ────────────────────────────────────────────────
+      // The WS can close normally (isFinal / server close) after the LLM produced
+      // text but BEFORE any `msg.audio` ever arrived — e.g. ElevenLabs returned an
+      // empty/errored generation without a WS-level error event. Previously this
+      // resolved as a "success" with reply text, so the caller never fell back —
+      // the client would see the transcript logged but hear nothing. Now: if we
+      // have text but never streamed audio, synthesize it via the REST fallback
+      // right here so the turn is never silently dropped.
+      if (clean && !audioFired && ws.readyState === WebSocket.OPEN && !session.closed) {
+        console.warn(`[eleven-stream] no audio arrived despite text reply — REST fallback callSid=${callSid}`);
+        try {
+          const fallbackAudio = await synthesizeSpeech(session, clean);
+          if (fallbackAudio && ws.readyState === WebSocket.OPEN && !session.closed) {
+            clearEnablexMedia(ws, session);
+            await recordAgentAudio(session, fallbackAudio, "agent-reply-fallback");
+            sendEnablexMedia(ws, session, fallbackAudio, "eleven-stream-silent-fallback");
+          }
+        } catch (err) {
+          console.warn(`[eleven-stream] REST fallback also failed callSid=${callSid}: ${err.message}`);
+        }
+      }
+
       // Broadcast to live feed dashboard subscribers
       if (clean) broadcastLiveEvent(session, { type: "agent_reply", text: clean });
       resolve(clean);
@@ -3585,7 +3634,12 @@ function openDeepgramStream(ws, session, callSid) {
     encoding:        "mulaw",
     sample_rate:     "8000",
     model:           process.env.DEEPGRAM_MODEL || "nova-2-general",
-    endpointing:     process.env.DEEPGRAM_ENDPOINTING || "150",  // 150ms silence → speech_final (was 300ms — reduces latency)
+    // 250ms silence → speech_final. 150ms was too aggressive for Hindi/Hinglish speech,
+    // which has more mid-sentence pauses than English — it fired speech_final mid-thought
+    // and truncated the tail of what the caller was saying. +100ms is a small latency
+    // cost for a meaningfully lower false-cutoff rate; full semantic turn-detection
+    // (waiting longer when the transcript trails off incomplete) is a larger follow-up.
+    endpointing:     process.env.DEEPGRAM_ENDPOINTING || "250",
     interim_results: "false",   // skip partials — only act on finals
     smart_format:    "true",    // normalises numbers/punctuation
   });
@@ -3736,8 +3790,12 @@ async function processTranscriptDirect(ws, session, callSid, transcriptText, sou
   // Echo guard moved here: drop any transcript that fires while agent is speaking or during
   // the brief echo tail — these are the agent's own voice reflecting back from the phone.
   if (session.telephony?.echoSuppressionUntil && Date.now() < session.telephony.echoSuppressionUntil) {
-    console.log(`[deepgram] echo-suppressed transcript="${transcriptText.slice(0, 40)}" callSid=${callSid}`);
-    return;
+    if (isLikelyEcho(transcriptText, session)) {
+      console.log(`[deepgram] echo-suppressed transcript="${transcriptText.slice(0, 40)}" callSid=${callSid}`);
+      return;
+    }
+    console.log(`[deepgram] within suppression window but content doesn't match agent's last line — treating as real speech callSid=${callSid} transcript="${transcriptText.slice(0, 60)}"`);
+    // fall through — this is genuine caller speech, not an echo
   }
 
   // Deduplicate — Deepgram can fire speech_final twice for the same phrase
@@ -4046,15 +4104,18 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer, rawMula
   }
 
   // ── Barge-in detection ───────────────────────────────────────────────────────
-  // Caller speaks while agent is playing → cancel agent audio after 6 sustained frames (120ms).
+  // Caller speaks while agent is playing → cancel agent audio after sustained frames.
   // Echo suppression window: ignore barge-in for the first echoSuppressionUntil ms — the
   // phone mic picks up the agent's own TTS playback and detectSpeech returns true, causing
-  // a false barge-in that kills the mulaw queue after only 120ms (12 frames × 20ms) with
-  // hundreds of chunks still pending. Only count real barge-in AFTER the echo window passes.
+  // a false barge-in that kills the mulaw queue with hundreds of chunks still pending.
+  // Only count real barge-in AFTER the echo window passes.
+  // Threshold lowered 6→4 frames (120ms→80ms): 6 frames clipped the first syllable of a
+  // deliberate interruption before the agent audio actually stopped.
+  const BARGEIN_CONFIRM_FRAMES = 4;
   if (session.telephony?.agentSpeakingUntil && Date.now() < session.telephony.agentSpeakingUntil) {
     if (hasSpeech && Date.now() >= (session.telephony.echoSuppressionUntil || 0)) {
       inbound.bargeinFrames = (inbound.bargeinFrames || 0) + 1;
-      if (inbound.bargeinFrames >= 6) {
+      if (inbound.bargeinFrames >= BARGEIN_CONFIRM_FRAMES) {
         // Barge-in confirmed — stop agent audio, clear suppression windows
         clearEnablexMedia(ws, session);
         session.telephony.agentSpeakingUntil   = 0;
@@ -4063,7 +4124,7 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer, rawMula
         inbound.bargeinBuffer      = [];
         inbound.speculativePromise = null;
         inbound.speculativeAudio   = null;
-        console.log(`[enablex-media] barge-in confirmed (6 frames) callSid=${callSid}`);
+        console.log(`[enablex-media] barge-in confirmed (${BARGEIN_CONFIRM_FRAMES} frames) callSid=${callSid}`);
       }
     } else {
       inbound.bargeinFrames = 0; // reset on silence or during echo suppression window
@@ -4085,7 +4146,9 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer, rawMula
   // rather than the audio level. Deepgram may transcribe agent echo during playback, but
   // those transcripts are silently dropped by echoSuppressionUntil check in processTranscriptDirect.
   if (session.deepgramWs?.readyState === WebSocket.OPEN && session.deepgramReady) {
-    const mulaw = rawMulaw || encodePcm16ToMuLaw(downsamplePcm16To8k(audioBuffer));
+    // Anti-aliased resample (not naive decimation) — aliasing here degrades STT accuracy
+    // just as much as it distorts TTS output, and shows up as missed/garbled words.
+    const mulaw = rawMulaw || encodePcm16ToMuLaw(resamplePcm16(audioBuffer, 16000, 8000));
     try {
       session.deepgramWs.send(mulaw);
     } catch (err) {
