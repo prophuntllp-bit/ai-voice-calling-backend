@@ -1043,6 +1043,10 @@ const GEMINI_LANG_NAMES = {
 };
 
 async function transcribeAudioGemini(audioBuffer, language = "auto") {
+  if (sttGeminiBreaker.onCooldown()) {
+    console.warn(`[stt-gemini] on cooldown (${sttGeminiBreaker.reason()}) — skipping call`);
+    return null;
+  }
   const wav = ensureWavBuffer(audioBuffer);
   const langHint = GEMINI_LANG_NAMES[language]
     ? ` The speaker is likely speaking ${GEMINI_LANG_NAMES[language]}, possibly mixed with English (Hinglish).`
@@ -1051,27 +1055,36 @@ async function transcribeAudioGemini(audioBuffer, language = "auto") {
     + `original language/script — no translation, no explanation, no quotes, no labels.${langHint} `
     + `If the audio is silent, noise, or unintelligible, output nothing.`;
   const t0 = Date.now();
-  const response = await timed("stt_gemini", () =>
-    axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_STT_MODEL || "gemini-2.5-flash"}:generateContent`,
-      {
-        contents: [{
-          parts: [
-            { text: prompt },
-            { inline_data: { mime_type: "audio/wav", data: wav.toString("base64") } },
-          ],
-        }],
-        generationConfig: { temperature: 0, maxOutputTokens: 200 },
-      },
-      {
-        headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "Content-Type": "application/json" },
-        timeout: 12000,
-      }
-    )
-  );
-  const text = (response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-  console.log(`[stt-gemini] latency=${Date.now()-t0}ms text="${text.slice(0, 80)}"`);
-  return { text, language: language === "auto" ? "hi" : language };
+  try {
+    const response = await timed("stt_gemini", () =>
+      axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_STT_MODEL || "gemini-2.5-flash"}:generateContent`,
+        {
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: "audio/wav", data: wav.toString("base64") } },
+            ],
+          }],
+          generationConfig: { temperature: 0, maxOutputTokens: 200 },
+        },
+        {
+          headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "Content-Type": "application/json" },
+          timeout: 12000,
+        }
+      )
+    );
+    const text = (response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    console.log(`[stt-gemini] latency=${Date.now()-t0}ms text="${text.slice(0, 80)}"`);
+    return { text, language: language === "auto" ? "hi" : language };
+  } catch (err) {
+    const status = err.response?.status;
+    console.warn(`[stt-gemini] failed (${Date.now()-t0}ms): ${err.message}`);
+    if (status === 429 || status === 402 || status === 401 || status === 403) {
+      sttGeminiBreaker.trip(status);
+    }
+    throw err;
+  }
 }
 
 async function transcribeAudioDirect(audioBuffer, language = "auto", providerOverride = null) {
@@ -1635,7 +1648,7 @@ async function getLLMResponse(session, userText) {
   // ── Gemini (only when explicitly selected via provider override — e.g. the
   // browser test lab's bake-off dropdown). Gemini's chat/completions endpoint
   // is OpenAI-compatible, so it reuses the same collectStreamingReply parser. ──
-  if (session.providerOverrides?.llm === "gemini" && process.env.GEMINI_API_KEY) {
+  if (session.providerOverrides?.llm === "gemini" && process.env.GEMINI_API_KEY && !llmGeminiBreaker.onCooldown()) {
     try {
       const t0 = Date.now();
       const response = await timed("gemini", () =>
@@ -1659,6 +1672,9 @@ async function getLLMResponse(session, userText) {
       return reply.replace(/OUTCOME:({.*})/s, "").trim();
     } catch (err) {
       const statusCode = err.response?.status;
+      if (statusCode === 429 || statusCode === 402 || statusCode === 401 || statusCode === 403) {
+        llmGeminiBreaker.trip(statusCode);
+      }
       const errBody = safeErrBody(err.response?.data);
       console.warn(`[gemini] failed (HTTP ${statusCode || "?"}) falling back to OpenAI/Groq: ${err.message} — ${errBody}`);
     }
@@ -2165,6 +2181,10 @@ async function synthesizeSpeechSarvam(text, voiceId, lang, modelOverride = null)
 const GEMINI_TTS_SAMPLE_RATE = 24000;
 async function synthesizeSpeechGemini(text, voiceName, emotion) {
   if (!process.env.GEMINI_API_KEY) return null;
+  if (ttsGeminiBreaker.onCooldown()) {
+    console.warn(`[tts-gemini] on cooldown (${ttsGeminiBreaker.reason()}) — skipping call`);
+    return null;
+  }
   const t0 = Date.now();
   // Gemini TTS takes style instructions as natural language rather than numeric
   // sliders — prepend a short tone cue so emotion actually affects the delivery.
@@ -2200,8 +2220,12 @@ async function synthesizeSpeechGemini(text, voiceName, emotion) {
     console.log(`[tts-gemini] latency=${Date.now()-t0}ms voice=${voiceName || "Kore"}`);
     return createWavBuffer(pcm, GEMINI_TTS_SAMPLE_RATE);
   } catch (err) {
+    const status = err.response?.status;
     const body = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : "";
     console.warn(`[tts-gemini] failed (${Date.now()-t0}ms): ${err.message}${body ? " body=" + body : ""}`);
+    if (status === 429 || status === 402 || status === 401 || status === 403) {
+      ttsGeminiBreaker.trip(status);
+    }
     return null;
   }
 }
@@ -2234,6 +2258,9 @@ function createTtsCircuitBreaker(label) {
 }
 const ttsMicroserviceBreaker = createTtsCircuitBreaker("microservice");
 const ttsSarvamBreaker       = createTtsCircuitBreaker("sarvam");
+const ttsGeminiBreaker       = createTtsCircuitBreaker("gemini");
+const sttGeminiBreaker       = createTtsCircuitBreaker("stt-gemini");
+const llmGeminiBreaker       = createTtsCircuitBreaker("llm-gemini");
 
 async function synthesizeSpeech(session, text) {
   const normalizedText = normalizeTtsText(text);
