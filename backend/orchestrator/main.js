@@ -1602,7 +1602,7 @@ async function getLLMResponse(session, userText) {
           }
         )
       );
-      const reply = await collectStreamingReply(response);
+      const reply = stripFillerOpener(await collectStreamingReply(response));
       console.log(`[openai] callSid=${session.callSid} latency=${Date.now()-t0}ms model=${process.env.OPENAI_MODEL || "gpt-4.1"} reply="${reply.slice(0,60)}"`);
       session.history.push({ role: "assistant", content: reply });
       const match = reply.match(/OUTCOME:({.*})/s);
@@ -1636,7 +1636,7 @@ async function getLLMResponse(session, userText) {
           }
         )
       );
-      const reply = await collectStreamingReply(response);
+      const reply = stripFillerOpener(await collectStreamingReply(response));
       console.log(`[groq] callSid=${session.callSid} latency=${Date.now()-t0}ms reply="${reply.slice(0,60)}"`);
       session.history.push({ role: "assistant", content: reply });
       const match = reply.match(/OUTCOME:({.*})/s);
@@ -1671,7 +1671,7 @@ async function getLLMResponse(session, userText) {
           { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, responseType: "stream", timeout: 8000 }
         )
       );
-      const reply = await collectStreamingReply(response);
+      const reply = stripFillerOpener(await collectStreamingReply(response));
       console.log(`[openai_fallback] callSid=${session.callSid} latency=${Date.now()-t0}ms reply="${reply.slice(0,60)}"`);
       session.history.push({ role: "assistant", content: reply });
       const match = reply.match(/OUTCOME:({.*})/s);
@@ -1834,6 +1834,25 @@ function splitIntoSentences(text) {
   }
   if (buf) merged.push(buf.trim());
   return merged.length ? merged : [text];
+}
+
+// ── Strip forced/habitual filler openers ("Haan...", "Achha...", "Hmm...") ───
+// Applied regardless of which system prompt produced the reply — the auto-generated
+// fallback prompt AND any custom prompt saved in the dashboard could both instruct
+// (or habitually drift toward) opening every turn with the same filler word, which
+// reads as a robotic tic once a caller notices the pattern after a few turns.
+// Only strips a filler word immediately followed by "..."/"…"/"," — i.e. the exact
+// "word-then-pause" shape a forced-filler instruction produces — so a genuine
+// affirmation like "Haan, bilkul sahi bola aapne" (no pause) is left untouched.
+// Only "..."/"…" count as the pause marker — NOT a comma. A comma after a filler
+// word ("Haan, bilkul sahi bola aapne") is a normal sentence continuation, not the
+// robotic "word-then-pause" tic the forced-filler instruction produced.
+const FILLER_OPENER_RE = /^(?:haan|ha|hey|hmm+|ac{1,2}h{1,2}a|samjha|samajha|dekhiye|dekho|bilkul|theek(?:\s+hai)?|arre+y?\s*wah|sure|right|okay|ok|well|bghaa|mm+-?hmm+|हाँ|हां|अच्छा|हम्म+|समझ[ाी]|देखिए|बिल्कुल|ठीक(?:\s+है)?|अरे\s*वाह)[\s]*(?:\.\.\.|…|-{2,})+\s*/iu;
+function stripFillerOpener(text) {
+  if (!text) return text;
+  const stripped = text.replace(FILLER_OPENER_RE, "");
+  if (!stripped || stripped === text) return text;
+  return stripped.charAt(0).toUpperCase() + stripped.slice(1);
 }
 
 // Hard-cap reply to MAX_WORDS words to prevent long TTS audio.
@@ -2915,6 +2934,28 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
     if (!audioFired) { audioFired = true; if (onFirstAudio) onFirstAudio(); }
   }
 
+  // ── Leading-filler strip, applied before ANY text reaches ElevenLabs ───────
+  // By the time the WS "close" event fires the reply has already been spoken —
+  // stripping after the fact can't un-speak it. So the very first piece of text
+  // is held back (a few tokens' worth) until there's enough of it to tell whether
+  // it's a filler opener; only then does anything get sent to ElevenLabs. This
+  // adds at most a handful of tokens' worth of latency (tens of ms), not the
+  // whole reply.
+  let leadDecided = false;
+  let leadBuffer  = "";
+  function resolveLead(pieceSoFar, force) {
+    const hasBreak = /[\s.,…]$/.test(pieceSoFar);
+    if (!force && pieceSoFar.length < 15 && !hasBreak) return null; // keep buffering
+    leadDecided = true;
+    const strippedLead = stripFillerOpener(pieceSoFar);
+    if (strippedLead !== pieceSoFar) {
+      console.log(`[eleven-stream] stripped filler opener callSid=${callSid}`);
+      fullText  = strippedLead + fullText.slice(pieceSoFar.length);
+      wordCount = fullText.trim().split(/\s+/).length;
+    }
+    return strippedLead;
+  }
+
   return new Promise((resolve, reject) => {
     const wsUrl =
       `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input` +
@@ -2957,13 +2998,29 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
             const d = line.slice(6).trim();
             if (d === "[DONE]") {
               doneSending = true;
-              if (batch) elevenWs.send(JSON.stringify({ text: normalizeTtsText(batch) }));
+              if (batch) {
+                if (!leadDecided) {
+                  leadBuffer += batch;
+                  const resolved = resolveLead(leadBuffer, /* force */ true);
+                  if (resolved) elevenWs.send(JSON.stringify({ text: normalizeTtsText(resolved) }));
+                } else {
+                  elevenWs.send(JSON.stringify({ text: normalizeTtsText(batch) }));
+                }
+              }
               elevenWs.send(JSON.stringify({ text: "" }));
               return;
             }
             try { const tok = JSON.parse(d).choices?.[0]?.delta?.content || ""; fullText += tok; batch += tok; wordCount = fullText.trim().split(/\s+/).length; } catch {}
           }
           if (!batch || doneSending) return;
+
+          if (!leadDecided) {
+            leadBuffer += batch;
+            const resolved = resolveLead(leadBuffer, false);
+            if (resolved === null) return; // still buffering — not enough text yet to decide
+            batch = resolved; // send the (possibly filler-stripped) buffered lead now
+          }
+
           // Normalize abbreviations BEFORE sending to ElevenLabs — fixes "BHKA", "2BHK" mispronunciations
           const normalizedBatch = normalizeTtsText(batch);
           if (wordCount >= maxWords) {
@@ -3114,6 +3171,10 @@ async function streamingLLMWithLocalTTS(ws, session, userText) {
     if (sentCount >= MAX_SENTS || stopped()) return;
     sentCount++;
     const idx = sentCount;
+    // Strip a filler opener ("Haan...", "Achha...") on the FIRST sentence only —
+    // same fix as the ElevenLabs streaming path, applied here since this path knows
+    // the full sentence text upfront (no token-buffering needed).
+    if (idx === 1) text = stripFillerOpener(text);
     const ttsPromise = synthesizeSpeech(session, normalizeTtsText(text)).catch(() => null);
     drainChain = drainChain.then(async () => {
       if (stopped()) return;
@@ -3190,7 +3251,9 @@ async function streamingLLMWithLocalTTS(ws, session, userText) {
       return null;
     }
 
-    const reply = fullText.trim();
+    // Keep history/transcript in sync with what was actually spoken — the first
+    // fired sentence had its filler opener stripped before synthesis.
+    const reply = stripFillerOpener(fullText.trim());
     session.history.push({ role: "assistant", content: reply });
     const m = reply.match(/OUTCOME:({.*})/s);
     if (m) { try { session.outcome = JSON.parse(m[1]); } catch {} }
@@ -4360,9 +4423,12 @@ app.post("/call/dial", requireToken, async (req, res) => {
   try {
     await persistSession(session);
     const greeting = await getOpeningMessage(session);
-    // Synthesize greeting and pre-warm in background — don't block the dial response
+    // Synthesize greeting and pre-warm in background — don't block the dial response.
+    // Pre-warm is delayed so it doesn't compete for TTS provider concurrency with the
+    // greeting itself — firing both at once was a real cause of 429 (rate limit) bursts
+    // right at call start, which also slowed down the greeting/first-turn TTS.
     synthesizeSpeech(session, greeting).then(audio => { session.pendingGreetingAudio = audio; }).catch(() => {});
-    prewarmTTSCache(session).catch(() => {});
+    setTimeout(() => { if (!session.closed) prewarmTTSCache(session).catch(() => {}); }, 3000);
     const provider = resolveTelephonyProvider(req.body.provider);
 
     if (provider === "enablex") {
