@@ -1038,15 +1038,15 @@ const SARVAM_LANG_MAP = {
   "mal": "ml-IN",
 };
 
-async function transcribeAudioDirect(audioBuffer, language = "auto") {
+async function transcribeAudioDirect(audioBuffer, language = "auto", providerOverride = null) {
   const elevenKey = process.env.ELEVENLABS_API_KEY;
   const sarvamKey = process.env.SARVAM_API_KEY;
 
   // STT_PROVIDER controls which engine runs first.
   // "elevenlabs" → ElevenLabs Scribe first (better accuracy, auto language detection)
-  // "elevenlabs" → ElevenLabs Scribe first (auto lang detection)
   // Default      → sarvam
-  const sttProvider = (process.env.STT_PROVIDER || "sarvam").toLowerCase();
+  // providerOverride (per-session, from browser test harness) takes precedence over env.
+  const sttProvider = (providerOverride || process.env.STT_PROVIDER || "sarvam").toLowerCase();
   const useSarvamFirst = sttProvider === "sarvam" && !!sarvamKey;
 
   // ── Sarvam Saarika v2.5 (primary when STT_PROVIDER=sarvam) ───────────────
@@ -1577,7 +1577,10 @@ async function getLLMResponse(session, userText) {
   // ── Groq primary when LLM_PREFER_GROQ=true OR no OpenAI key ─────────────────
   // Groq llama-3.1-8b-instant: 50–150ms TTFT vs OpenAI 300–800ms.
   // Set LLM_PREFER_GROQ=true in Railway env to enable Groq-first routing.
-  const preferGroq = process.env.LLM_PREFER_GROQ === "true";
+  // Per-session override (browser test harness) takes precedence over env.
+  const preferGroq = session.providerOverrides?.llm
+    ? session.providerOverrides.llm === "groq"
+    : process.env.LLM_PREFER_GROQ === "true";
 
   // ── OpenAI (primary unless preferGroq=true) ───────────────────────────────
   if (process.env.OPENAI_API_KEY && !preferGroq) {
@@ -1981,12 +1984,12 @@ function normalizeTtsText(text) {
     .replace(/\bN-S\b/gi,  "north south");
 }
 
-async function synthesizeSpeechSarvam(text, voiceId, lang) {
+async function synthesizeSpeechSarvam(text, voiceId, lang, modelOverride = null) {
   const sarvamKey = process.env.SARVAM_API_KEY;
   if (!sarvamKey) return null;
   const langCode = SARVAM_LANG_MAP[lang] || "hi-IN";
   const speaker = voiceId || "meera";
-  const model = process.env.SARVAM_TTS_MODEL || "bulbul:v3";
+  const model = modelOverride || process.env.SARVAM_TTS_MODEL || "bulbul:v3";
   const t0 = Date.now();
   try {
     const response = await timed("tts_sarvam", () =>
@@ -2042,11 +2045,16 @@ async function synthesizeSpeech(session, text) {
   }
   voiceId = voiceId.toLowerCase();
 
-  const ttsProvider = (process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+  // Per-session overrides (browser test harness) — voice ID kept case-sensitive
+  // because ElevenLabs voice IDs are case-sensitive; Sarvam speakers are lowercase anyway.
+  if (session.providerOverrides?.ttsVoice) voiceId = session.providerOverrides.ttsVoice;
+
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
 
   // ── Sarvam Bulbul TTS (primary when TTS_PROVIDER=sarvam, default) ─────────
   if (ttsProvider === "sarvam" || ttsProvider === "bulbul") {
-    const audio = await synthesizeSpeechSarvam(normalizedText, voiceId, lang);
+    const sarvamModel = /^bulbul:/.test(session.providerOverrides?.ttsModel || "") ? session.providerOverrides.ttsModel : null;
+    const audio = await synthesizeSpeechSarvam(normalizedText, voiceId, lang, sarvamModel);
     if (audio) return audio;
     console.warn("[tts] Sarvam failed, falling back to microservice");
   }
@@ -2086,6 +2094,8 @@ async function persistSession(session) {
   // Remove non-serializable objects — WebSocket and timer have circular refs that break JSON.stringify
   delete serializable.timer;
   delete serializable.deepgramWs;      // WebSocket → TLSSocket → HTTPParser (circular)
+  delete serializable._mediaWs;        // media WebSocket (circular) — kept for STT switches
+  delete serializable.agniBridge;      // LiveKit room refs (circular)
   delete serializable.inboundAudio;    // Buffers can be large — not needed in Redis
   delete serializable.recordings;      // PCM buffer arrays — not needed in Redis
   try {
@@ -2569,7 +2579,9 @@ function decodeEnablexInboundMedia(event) {
 function sendEnablexMedia(ws, session, audioBuffer, label = "audio") {
   const streamId = session.telephony?.streamId;
   const voiceId = session.telephony?.voiceId || session.callSid;
-  if (!audioBuffer || ws.readyState !== WebSocket.OPEN || session.telephony?.provider !== "enablex" || !streamId || !voiceId) {
+  const mediaProvider = session.telephony?.provider;
+  // "browser" = test harness — same media protocol over WS, browser decodes μ-law client-side
+  if (!audioBuffer || ws.readyState !== WebSocket.OPEN || (mediaProvider !== "enablex" && mediaProvider !== "browser") || !streamId || !voiceId) {
     return false;
   }
   const chunks = toEnablexMuLawChunks(audioBuffer);
@@ -2654,18 +2666,21 @@ function scheduleAgentSideHangup(ws, session, reason = "completed-reply") {
       ws.close(1000, "agent-ended");
     }
 
-    // Step 3: Brief pause then call REST hangup API as belt-and-suspenders
-    await new Promise((r) => setTimeout(r, 600));
-    try {
-      await hangupEnablexCall(voiceId);
-      console.log("[enablex-media] hangup API succeeded", { callSid: callSidSnapshot, voiceId });
-    } catch (error) {
-      console.warn("[enablex-media] hangup API call failed", {
-        callSid: callSidSnapshot,
-        voiceId,
-        status: error.response?.status,
-        body: error.response?.data || error.message,
-      });
+    // Step 3: Brief pause then call REST hangup API as belt-and-suspenders.
+    // Browser test sessions have no EnableX call to hang up — WS close is enough.
+    if (current.telephony?.provider === "enablex") {
+      await new Promise((r) => setTimeout(r, 600));
+      try {
+        await hangupEnablexCall(voiceId);
+        console.log("[enablex-media] hangup API succeeded", { callSid: callSidSnapshot, voiceId });
+      } catch (error) {
+        console.warn("[enablex-media] hangup API call failed", {
+          callSid: callSidSnapshot,
+          voiceId,
+          status: error.response?.status,
+          body: error.response?.data || error.message,
+        });
+      }
     }
 
     // Step 4: Clean up our session (ws.on("close") may also call endCall, but endCall is idempotent)
@@ -2692,7 +2707,8 @@ function createMulawStreamQueue(ws, session, label = "stream") {
   const voiceId  = session.telephony?.voiceId  || session.callSid;
   const streamId = session.telephony?.streamId;
   if (!streamId || !voiceId || ws.readyState !== WebSocket.OPEN) return null;
-  if (session.telephony?.provider !== "enablex") return null;
+  const queueProvider = session.telephony?.provider;
+  if (queueProvider !== "enablex" && queueProvider !== "browser") return null;
 
   const generation = (session.telephony.outGeneration || 0) + 1;
   session.telephony.outGeneration = generation;
@@ -2784,8 +2800,19 @@ function createMulawStreamQueue(ws, session, label = "stream") {
 async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio } = {}) {
   const elevenKey = process.env.ELEVENLABS_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
-  const ttsProvider = (process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
-  if (!elevenKey || !openaiKey || ttsProvider !== "elevenlabs") return null;
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+
+  // LLM selection — per-session override > LLM_PREFER_GROQ env > OpenAI default.
+  // Groq's chat/completions API is OpenAI-compatible so the same SSE parser works.
+  const llmPref = session.providerOverrides?.llm
+    || (process.env.LLM_PREFER_GROQ === "true" ? "groq" : "openai");
+  const useGroq  = llmPref === "groq" && !!process.env.GROQ_API_KEY;
+  const llmUrl   = useGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+  const llmKey   = useGroq ? process.env.GROQ_API_KEY : openaiKey;
+  const llmModel = useGroq
+    ? (process.env.GROQ_MODEL || "llama-3.3-70b-versatile")
+    : (process.env.OPENAI_MODEL || "gpt-4.1");
+  if (!elevenKey || !llmKey || ttsProvider !== "elevenlabs") return null;
 
   const callSid  = session.callSid;
   // Hard cap for ElevenLabs streaming — Hindi TTS is ~1.4 words/sec, 15 words ≈ 10s audio.
@@ -2796,13 +2823,15 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
   // Set high (30) so a normal reply is NEVER hard-cut mid-word; this only catches
   // a true runaway. The LLM finishes its sentence naturally well before 30.
   const maxWords = Math.min(agentWordCap, parseInt(process.env.TTS_MAX_WORDS_STREAM || "30", 10));
-  const model    = process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
+  // ttsModel override only applies here when it's an ElevenLabs model id (browser test may carry a Sarvam model)
+  const modelOverride = /^eleven/.test(session.providerOverrides?.ttsModel || "") ? session.providerOverrides.ttsModel : null;
+  const model    = modelOverride || process.env.ELEVENLABS_MODEL || "eleven_multilingual_v2";
 
-  // Voice ID — same resolution as TTS service
+  // Voice ID — per-session override > env by gender
   const gender = session.campaign?.voice_gender || session.lead?.voice_gender || "female";
-  const voiceId = gender === "male"
+  const voiceId = session.providerOverrides?.ttsVoice || (gender === "male"
     ? (process.env.ELEVENLABS_VOICE_MALE   || "pNInz6obpgDQGcFmaJgB")
-    : (process.env.ELEVENLABS_VOICE_FEMALE || process.env.ELEVENLABS_VOICE_ID || "1qEiC6qsybMkmnNdVMbK");
+    : (process.env.ELEVENLABS_VOICE_FEMALE || process.env.ELEVENLABS_VOICE_ID || "1qEiC6qsybMkmnNdVMbK"));
 
   // Emotion → voice settings
   const emotion = emotionFromContext(userText, { stage: session.stage });
@@ -2886,9 +2915,9 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
       // LLM streaming — tokens pipe directly into ElevenLabs WS
       try {
         const llmResp = await axios.post(
-          "https://api.openai.com/v1/chat/completions",
-          { model: process.env.OPENAI_MODEL || "gpt-4.1", messages, temperature: 0.4, max_tokens: 70, stream: true },
-          { headers: { Authorization: `Bearer ${openaiKey}` }, responseType: "stream", timeout: 8000 }
+          llmUrl,
+          { model: llmModel, messages, temperature: 0.4, max_tokens: 70, stream: true },
+          { headers: { Authorization: `Bearer ${llmKey}` }, responseType: "stream", timeout: 8000 }
         );
         let remainder = "";
         llmResp.data.on("data", (chunk) => {
@@ -2981,8 +3010,8 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
 async function streamingLLMWithLocalTTS(ws, session, userText) {
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!openaiKey) return null;
-  // Only used when ElevenLabs is not the TTS provider
-  const ttsProvider = (process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+  // Only used when ElevenLabs is not the TTS provider (per-session override aware)
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
   if (ttsProvider === "elevenlabs" && process.env.ELEVENLABS_API_KEY) return null;
 
   const callSid = session.callSid;
@@ -3167,13 +3196,13 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
       transcription = await specPromise;
       if (!transcription?.text) {
         // Speculative failed, run full transcription now
-        transcription = await transcribeAudioDirect(utteranceAudio, languageManager.getBaseLanguage(callSid) || "auto");
+        transcription = await transcribeAudioDirect(utteranceAudio, languageManager.getBaseLanguage(callSid) || "auto", session.providerOverrides?.stt);
       }
       console.log(`[stt] SPECULATIVE callSid=${callSid} wait=${Date.now()-t0}ms text="${transcription?.text || ""}"`);
     } else {
       // Utterance grew significantly after speculative fired — full audio is more accurate
       const baseLang = languageManager.getBaseLanguage(callSid) || "auto";
-      transcription = await transcribeAudioDirect(utteranceAudio, baseLang);
+      transcription = await transcribeAudioDirect(utteranceAudio, baseLang, session.providerOverrides?.stt);
       console.log(`[stt] FRESH callSid=${callSid} latency=${Date.now()-t0}ms text="${transcription?.text || ""}"`);
     }
     console.log(`[stt] result: "${transcription?.text || ""}" lang=${transcription?.language || ""} elapsed=${Date.now()-t0}ms`);
@@ -4095,7 +4124,7 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer, rawMula
       const earlySnap = Buffer.concat(inbound.chunks);
       const baseLang = languageManager.getBaseLanguage(callSid) || "auto";
       inbound.speculativeAudio   = earlySnap;
-      inbound.speculativePromise = transcribeAudioDirect(earlySnap, baseLang)
+      inbound.speculativePromise = transcribeAudioDirect(earlySnap, baseLang, session.providerOverrides?.stt)
         .catch(err => {
           console.warn(`[speculative-stt] failed callSid=${callSid}:`, err.message);
           return null;
@@ -4342,6 +4371,83 @@ app.post("/call/bulk-dial", requireToken, async (req, res) => {
   res.json({ campaign_id: campaignId, queued: results.length, results });
 });
 
+// ── Browser test harness (Phase 0) ───────────────────────────────────────────
+// Creates a call session that runs the FULL production pipeline (VAD/STT/LLM/TTS,
+// barge-in, echo logic) but exchanges audio with a browser page over the media WS
+// instead of EnableX. Providers are switchable per session AND mid-call, so
+// STT/TTS/LLM engines can be A/B tested by ear without spending telephony minutes.
+const BROWSER_TEST_PROVIDERS = {
+  stt: new Set(["deepgram", "sarvam", "elevenlabs"]),
+  tts: new Set(["elevenlabs", "sarvam"]),
+  llm: new Set(["openai", "groq"]),
+};
+
+function sanitizeProviderOverrides(input = {}) {
+  const out = {};
+  if (BROWSER_TEST_PROVIDERS.stt.has(input.stt)) out.stt = input.stt;
+  if (BROWSER_TEST_PROVIDERS.tts.has(input.tts)) out.tts = input.tts;
+  if (BROWSER_TEST_PROVIDERS.llm.has(input.llm)) out.llm = input.llm;
+  if (typeof input.ttsVoice === "string" && /^[a-zA-Z0-9_-]{2,40}$/.test(input.ttsVoice.trim())) {
+    out.ttsVoice = input.ttsVoice.trim();
+  }
+  if (typeof input.ttsModel === "string" && /^[a-z0-9_.:-]{3,40}$/i.test(input.ttsModel.trim())) {
+    out.ttsModel = input.ttsModel.trim();
+  }
+  return out;
+}
+
+app.post("/call/browser-test", requireToken, async (req, res) => {
+  const body = req.body || {};
+  const lead = {
+    id: `browser-test-${Date.now()}`,
+    name: String(body.lead_name || "Test User").slice(0, 60),
+    phone: "browser-test",
+    project: String(body.project || "Test Project").slice(0, 100),
+    language: body.language || "hi",
+    voice_gender: body.voice_gender === "male" ? "male" : "female",
+  };
+  const campaign = {
+    name: lead.project,
+    opening_line: String(body.opening_line || "").slice(0, 500),
+    voice_gender: lead.voice_gender,
+  };
+  const session = createSession(lead, campaign);
+  session.isBrowserTest = true;
+  session.providerOverrides = sanitizeProviderOverrides(body.providers || {});
+  if (body.knowledge_base) {
+    session.dynamicVariables = { knowledge_base: String(body.knowledge_base).slice(0, 8000) };
+  }
+  session.telephony = { provider: "browser", outSeq: 0 };
+  await persistSession(session);
+  const wsBase = getPublicWsBaseUrl(req);
+  console.log(`[browser-test] session created callSid=${session.callSid} providers=${JSON.stringify(session.providerOverrides)}`);
+  return res.json({
+    call_sid: session.callSid,
+    ws_url: `${wsBase}/?callSid=${session.callSid}`,
+    live_url: `${wsBase}/live/${session.callSid}`,
+    providers: session.providerOverrides,
+  });
+});
+
+// Mid-call provider switch — takes effect on the agent's next turn.
+// Switching STT away from Deepgram closes the stream (batch path takes over);
+// switching back to Deepgram reopens it on the stored media WS.
+app.post("/call/browser-test/:callSid/providers", requireToken, (req, res) => {
+  const session = sessions.get(req.params.callSid);
+  if (!session || !session.isBrowserTest || session.closed) {
+    return res.status(404).json({ error: "Browser test session not found or ended" });
+  }
+  session.providerOverrides = { ...session.providerOverrides, ...sanitizeProviderOverrides(req.body || {}) };
+  const stt = session.providerOverrides.stt;
+  if (stt && stt !== "deepgram") {
+    closeDeepgramStream(session);
+  } else if (stt === "deepgram" && !session.deepgramWs && session._mediaWs?.readyState === WebSocket.OPEN) {
+    openDeepgramStream(session._mediaWs, session, session.callSid);
+  }
+  console.log(`[browser-test] providers switched callSid=${session.callSid} providers=${JSON.stringify(session.providerOverrides)}`);
+  return res.json({ ok: true, providers: session.providerOverrides });
+});
+
 app.post("/call/inbound", async (req, res) => {
   const { phone } = req.body;
   if (!phone) {
@@ -4478,24 +4584,31 @@ wss.on("connection", (ws, req) => {
           if (!session) return;
           session.telephony = {
             ...(session.telephony || {}),
-            provider: "enablex",
+            provider: session.isBrowserTest ? "browser" : "enablex",
             streamId,
             voiceId,
             callSid: voiceId,
             outSeq: session.telephony?.outSeq || 0,
           };
           session.status = "stream_started";
-          console.log(`[enablex-media] stream started for ${voiceId}`);
+          session._mediaWs = ws;  // kept for mid-call STT provider switches (browser test)
+          console.log(`[enablex-media] stream started for ${voiceId} provider=${session.telephony.provider}`);
+
+          // Browser test sessions always use the local pipeline (never Agni) so that
+          // STT/TTS/LLM provider overrides can be A/B tested from the test page.
+          const agniActive = config.agni.enabled && !session.isBrowserTest;
 
           // ── Deepgram streaming STT: open per-call WebSocket for real-time transcription ──
           // Opens immediately so it's ready before the first caller utterance.
           // Falls back to local VAD+STT if DEEPGRAM_API_KEY is not set.
-          if (!config.agni.enabled) {
+          // Skipped when the session's STT override picks a batch engine (sarvam/elevenlabs).
+          const sttOverride = session.providerOverrides?.stt;
+          if (!agniActive && (!sttOverride || sttOverride === "deepgram")) {
             openDeepgramStream(ws, session, voiceId);
           }
 
           // ── Agni mode: create LiveKit session, skip local greeting synthesis ──
-          if (config.agni.enabled) {
+          if (agniActive) {
             try {
               // Base vars + any KB context passed from the dashboard at dial time
               const agniDynamicVars = {
@@ -4641,8 +4754,11 @@ wss.on("connection", (ws, req) => {
           }
         }
         audioBuffer = decodeEnablexInboundMedia(event);
-        // Preserve raw μ-law bytes for Deepgram (avoids re-encoding PCM→mulaw per frame)
-        if (session?.deepgramReady) {
+        // Preserve raw μ-law bytes for Deepgram (avoids re-encoding PCM→mulaw per frame).
+        // Only when the inbound payload actually IS μ-law — browser test sends linear PCM,
+        // which must go through the PCM→mulaw conversion in handleCallerAudioFrame instead.
+        const inboundEncoding = String(event.media.format?.encoding || "ulaw").toLowerCase();
+        if (session?.deepgramReady && !/linear|pcm|l16|s16/.test(inboundEncoding)) {
           session._rawMulawFrame = Buffer.from(event.media.payload, "base64");
         }
       } catch (error) {

@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Agent — Browser Test Lab</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --accent: #2f81f7; --green: #3fb950; --red: #f85149;
+    --amber: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
+  .layout { display: grid; grid-template-columns: 340px 1fr; gap: 16px; padding: 16px; max-width: 1200px; margin: 0 auto; min-height: 100vh; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  h1 { font-size: 17px; margin-bottom: 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 8px; }
+  h2:first-of-type { margin-top: 0; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  select, input[type=text], input[type=password], textarea {
+    width: 100%; background: #0d1117; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+  }
+  select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 54px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button {
+    border: none; border-radius: 6px; padding: 9px 14px; font-size: 13px; font-weight: 600;
+    cursor: pointer; color: #fff; background: var(--accent); width: 100%; margin-top: 10px;
+  }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.danger { background: var(--red); }
+  button.subtle { background: #21262d; border: 1px solid var(--border); }
+  .status-bar { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 1.6s infinite; }
+  .dot.connecting { background: var(--amber); }
+  @keyframes pulse { 50% { opacity: 0.5; } }
+  #transcript {
+    height: 420px; overflow-y: auto; background: #0d1117; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .msg { max-width: 82%; padding: 8px 11px; border-radius: 10px; line-height: 1.45; white-space: pre-wrap; }
+  .msg.agent { background: #1c2a3a; align-self: flex-start; border: 1px solid #24405e; }
+  .msg.user  { background: #22301c; align-self: flex-end;   border: 1px solid #35502b; }
+  .msg.sys   { background: transparent; color: var(--muted); font-size: 12px; align-self: center; padding: 2px; }
+  .msg .meta { display: block; font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .metrics { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .metrics b { color: var(--text); font-size: 15px; display: block; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px; background: #21262d; border: 1px solid var(--border); color: var(--muted); margin: 2px 2px 0 0; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+  #vu { height: 5px; background: #21262d; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  #vu > div { height: 100%; width: 0%; background: var(--green); transition: width 60ms linear; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ── Left: Model Lab ──────────────────────────────────────────────── -->
+  <div class="panel">
+    <h1>🎛️ Model Lab</h1>
+    <div class="hint">Switch STT / TTS / LLM and listen. Changes apply live — <b>Apply</b> mid-call affects the agent's next reply.</div>
+
+    <h2>Connection</h2>
+    <label>Orchestrator URL</label>
+    <input type="text" id="orchUrl" placeholder="https://orchestrator-....up.railway.app">
+    <label>Internal Token</label>
+    <input type="password" id="token" placeholder="X-Internal-Token">
+
+    <h2>Speech-to-Text (STT)</h2>
+    <select id="stt">
+      <option value="deepgram">Deepgram nova-2 (streaming — lowest latency)</option>
+      <option value="sarvam">Sarvam Saarika v2.5 (batch — best Hinglish)</option>
+      <option value="elevenlabs">ElevenLabs Scribe (batch)</option>
+    </select>
+
+    <h2>Text-to-Speech (TTS)</h2>
+    <select id="tts">
+      <option value="elevenlabs">ElevenLabs (streaming)</option>
+      <option value="sarvam">Sarvam Bulbul</option>
+    </select>
+    <label>Voice</label>
+    <select id="ttsVoice"></select>
+    <input type="text" id="ttsVoiceCustom" placeholder="…or paste custom voice ID" style="margin-top:6px; display:none;">
+    <label>TTS Model</label>
+    <select id="ttsModel"></select>
+
+    <h2>LLM</h2>
+    <select id="llm">
+      <option value="openai">OpenAI (env model)</option>
+      <option value="groq">Groq (fastest first token)</option>
+    </select>
+
+    <h2>Agent Setup</h2>
+    <div class="row2">
+      <div><label>Language</label>
+        <select id="language">
+          <option value="hi">Hindi / Hinglish</option>
+          <option value="mr">Marathi</option>
+          <option value="en">English</option>
+          <option value="auto">Auto-detect</option>
+        </select></div>
+      <div><label>Voice Gender</label>
+        <select id="gender"><option value="female">Female</option><option value="male">Male</option></select></div>
+    </div>
+    <div class="row2">
+      <div><label>Your Name (lead)</label><input type="text" id="leadName" value="Test User"></div>
+      <div><label>Project</label><input type="text" id="project" value="Mahindra Citadel"></div>
+    </div>
+    <label>Opening Line (optional)</label>
+    <textarea id="openingLine" placeholder="Leave blank for default Hindi opener"></textarea>
+    <label>Knowledge Base (optional, pasted text)</label>
+    <textarea id="kb" placeholder="Paste project facts: pricing, BHK, possession, RERA…"></textarea>
+
+    <button id="applyBtn" class="subtle" disabled>Apply providers to live call</button>
+  </div>
+
+  <!-- ── Right: Call ──────────────────────────────────────────────────── -->
+  <div class="panel">
+    <div class="status-bar">
+      <div class="dot" id="statusDot"></div>
+      <div id="statusText">Idle — configure providers, then start a call</div>
+    </div>
+    <div id="activeBadges"></div>
+    <div id="vu"><div></div></div>
+
+    <div class="row2">
+      <button id="startBtn">▶ Start Browser Call</button>
+      <button id="endBtn" class="danger" disabled>■ End Call</button>
+    </div>
+
+    <h2 style="margin-top:16px;">Live Transcript</h2>
+    <div id="transcript"></div>
+
+    <div class="metrics">
+      <div>Last response time<b id="mTtfa">—</b></div>
+      <div>Avg response time<b id="mAvg">—</b></div>
+      <div>Turns<b id="mTurns">0</b></div>
+      <div>Call duration<b id="mDur">0:00</b></div>
+    </div>
+    <div class="hint" style="margin-top:8px;">Response time = you stop speaking → first agent audio heard. Audio is 8kHz μ-law, exactly what phone callers hear.</div>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const cfg = window.__APP_CONFIG__ || {};
+
+  // ── Voice / model catalogs per TTS provider ────────────────────────────────
+  const CATALOG = {
+    elevenlabs: {
+      voices: [
+        { id: "", label: "Default (server env, by gender)" },
+        { id: "__custom__", label: "Custom voice ID…" },
+      ],
+      models: [
+        { id: "eleven_flash_v2_5", label: "Flash v2.5 — fastest (~75ms)" },
+        { id: "eleven_turbo_v2_5", label: "Turbo v2.5 — balanced" },
+        { id: "eleven_multilingual_v2", label: "Multilingual v2 — best prosody, slower" },
+      ],
+    },
+    sarvam: {
+      voices: [
+        { id: "anushka", label: "Anushka (F, v3)" }, { id: "manisha", label: "Manisha (F, v3)" },
+        { id: "vidya", label: "Vidya (F, v3)" }, { id: "arya", label: "Arya (F, v3)" },
+        { id: "abhilash", label: "Abhilash (M, v3)" }, { id: "karun", label: "Karun (M, v3)" },
+        { id: "hitesh", label: "Hitesh (M, v3)" },
+        { id: "ritu", label: "Ritu (F, legacy hi)" }, { id: "priya", label: "Priya (F, legacy en)" },
+        { id: "rahul", label: "Rahul (M, legacy hi)" }, { id: "roopa", label: "Roopa (F, legacy mr)" },
+        { id: "anand", label: "Anand (M, legacy mr)" },
+        { id: "__custom__", label: "Custom speaker…" },
+      ],
+      models: [
+        { id: "bulbul:v3", label: "Bulbul v3 (latest)" },
+        { id: "bulbul:v2", label: "Bulbul v2" },
+      ],
+    },
+  };
+
+  function refreshTtsOptions() {
+    const prov = $("tts").value;
+    const cat = CATALOG[prov];
+    $("ttsVoice").innerHTML = cat.voices.map(v => `<option value="${v.id}">${v.label}</option>`).join("");
+    $("ttsModel").innerHTML = cat.models.map(m => `<option value="${m.id}">${m.label}</option>`).join("");
+    $("ttsVoiceCustom").style.display = "none";
+  }
+  $("tts").addEventListener("change", refreshTtsOptions);
+  $("ttsVoice").addEventListener("change", () => {
+    $("ttsVoiceCustom").style.display = $("ttsVoice").value === "__custom__" ? "block" : "none";
+  });
+  refreshTtsOptions();
+
+  // ── Persisted connection settings ─────────────────────────────────────────
+  const DEFAULT_ORCH = "https://orchestrator-production-dde7.up.railway.app";
+  $("orchUrl").value = localStorage.getItem("tl_orch") || DEFAULT_ORCH;
+  $("token").value = localStorage.getItem("tl_token") || cfg.INTERNAL_TOKEN || "";
+
+  function providers() {
+    let ttsVoice = $("ttsVoice").value;
+    if (ttsVoice === "__custom__") ttsVoice = $("ttsVoiceCustom").value.trim();
+    const p = { stt: $("stt").value, tts: $("tts").value, llm: $("llm").value, ttsModel: $("ttsModel").value };
+    if (ttsVoice) p.ttsVoice = ttsVoice;
+    return p;
+  }
+
+  function showBadges() {
+    const p = providers();
+    $("activeBadges").innerHTML =
+      `<span class="badge">STT: ${p.stt}</span><span class="badge">TTS: ${p.tts}${p.ttsVoice ? " / " + p.ttsVoice : ""}</span>` +
+      `<span class="badge">${p.ttsModel}</span><span class="badge">LLM: ${p.llm}</span>`;
+  }
+
+  // ── Call state ─────────────────────────────────────────────────────────────
+  let mediaWs = null, liveWs = null, callSid = null;
+  let audioCtx = null, micStream = null, micNode = null, srcNode = null;
+  let playCursor = 0, activeSources = [];
+  let seq = 0, startedAt = 0, durTimer = null;
+  let sendCarry = new Float32Array(0);
+
+  // Latency metrics
+  let userSpeaking = false, userStoppedAt = 0, awaitingReply = false;
+  let ttfaList = [];
+  const MIC_RMS_THRESHOLD = 0.015;
+
+  function setStatus(state, text) {
+    $("statusDot").className = "dot " + state;
+    $("statusText").textContent = text;
+  }
+  function addMsg(cls, text, meta) {
+    const div = document.createElement("div");
+    div.className = "msg " + cls;
+    div.textContent = text;
+    if (meta) { const m = document.createElement("span"); m.className = "meta"; m.textContent = meta; div.appendChild(m); }
+    $("transcript").appendChild(div);
+    $("transcript").scrollTop = $("transcript").scrollHeight;
+  }
+
+  // ── μ-law decode (G.711) ───────────────────────────────────────────────────
+  const ULAW_TABLE = new Int16Array(256);
+  for (let i = 0; i < 256; i++) {
+    const u = ~i & 0xff;
+    let t = ((u & 0x0f) << 3) + 0x84;
+    t <<= (u & 0x70) >> 4;
+    ULAW_TABLE[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
+  }
+
+  function playUlaw(b64) {
+    if (!audioCtx) return;
+    const bin = atob(b64);
+    const n = bin.length;
+    const buf = audioCtx.createBuffer(1, n, 8000);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = ULAW_TABLE[bin.charCodeAt(i)] / 32768;
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    if (playCursor < now + 0.06) playCursor = now + 0.06; // small jitter buffer
+    src.start(playCursor);
+    playCursor += n / 8000;
+    activeSources.push(src);
+    src.onended = () => { const i = activeSources.indexOf(src); if (i >= 0) activeSources.splice(i, 1); };
+
+    // TTFA: first agent audio after the user stopped speaking
+    if (awaitingReply && userStoppedAt) {
+      const ttfa = Date.now() - userStoppedAt;
+      awaitingReply = false;
+      ttfaList.push(ttfa);
+      $("mTtfa").textContent = (ttfa / 1000).toFixed(2) + "s";
+      $("mAvg").textContent = (ttfaList.reduce((a, b) => a + b, 0) / ttfaList.length / 1000).toFixed(2) + "s";
+      $("mTurns").textContent = ttfaList.length;
+    }
+  }
+
+  function flushPlayback() {
+    for (const s of activeSources.splice(0)) { try { s.stop(); } catch (_) {} }
+    playCursor = 0;
+  }
+
+  // ── Mic capture → 16kHz PCM16 20ms frames ─────────────────────────────────
+  function pumpMic(float32, srcRate) {
+    // Resample to 16k (linear interpolation)
+    const ratio = srcRate / 16000;
+    const outLen = Math.floor(float32.length / ratio);
+    const merged = new Float32Array(sendCarry.length + outLen);
+    merged.set(sendCarry, 0);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio, lo = Math.floor(pos), hi = Math.min(lo + 1, float32.length - 1);
+      merged[sendCarry.length + i] = float32[lo] + (float32[hi] - float32[lo]) * (pos - lo);
+    }
+    // VU meter + local speech tracking for TTFA
+    let sumSq = 0;
+    for (let i = 0; i < outLen; i++) { const s = merged[sendCarry.length + i]; sumSq += s * s; }
+    const rms = Math.sqrt(sumSq / Math.max(outLen, 1));
+    $("vu").firstElementChild.style.width = Math.min(100, rms * 600) + "%";
+    if (rms > MIC_RMS_THRESHOLD) {
+      userSpeaking = true;
+      userStoppedAt = 0;
+    } else if (userSpeaking) {
+      userSpeaking = false;
+      userStoppedAt = Date.now();
+      awaitingReply = true;
+    }
+
+    // Slice into 320-sample (20ms @16k) frames and send
+    const FRAME = 320;
+    let off = 0;
+    while (off + FRAME <= merged.length) {
+      if (mediaWs?.readyState === WebSocket.OPEN) {
+        const pcm = new Int16Array(FRAME);
+        for (let i = 0; i < FRAME; i++) {
+          const s = Math.max(-1, Math.min(1, merged[off + i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        const bytes = new Uint8Array(pcm.buffer);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        mediaWs.send(JSON.stringify({
+          event: "media",
+          voice_id: callSid,
+          stream_id: "browser-" + callSid,
+          media: {
+            seq: ++seq,
+            timestamp: Date.now(),
+            format: { encoding: "l16", sample_rate: 16000, channels: 1 },
+            payload: btoa(bin),
+          },
+        }));
+      }
+      off += FRAME;
+    }
+    sendCarry = merged.slice(off);
+  }
+
+  // ── Start / end call ───────────────────────────────────────────────────────
+  async function startCall() {
+    const orch = $("orchUrl").value.trim().replace(/\/$/, "");
+    const token = $("token").value.trim();
+    if (!orch || !token) { alert("Set orchestrator URL and internal token first."); return; }
+    localStorage.setItem("tl_orch", orch);
+    localStorage.setItem("tl_token", token);
+
+    $("startBtn").disabled = true;
+    setStatus("connecting", "Requesting mic…");
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) {
+      setStatus("", "Mic permission denied");
+      $("startBtn").disabled = false;
+      return;
+    }
+
+    setStatus("connecting", "Creating test session…");
+    let resp;
+    try {
+      const r = await fetch(orch + "/call/browser-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Internal-Token": token },
+        body: JSON.stringify({
+          lead_name: $("leadName").value,
+          project: $("project").value,
+          language: $("language").value,
+          voice_gender: $("gender").value,
+          opening_line: $("openingLine").value,
+          knowledge_base: $("kb").value,
+          providers: providers(),
+        }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status + " — " + (await r.text()).slice(0, 200));
+      resp = await r.json();
+    } catch (e) {
+      setStatus("", "Session create failed: " + e.message);
+      cleanup(); return;
+    }
+    callSid = resp.call_sid;
+
+    // Media WS — same pipeline EnableX uses
+    setStatus("connecting", "Connecting audio stream…");
+    mediaWs = new WebSocket(resp.ws_url || (orch.replace(/^http/, "ws") + "/?callSid=" + callSid));
+    mediaWs.onopen = async () => {
+      mediaWs.send(JSON.stringify({ event: "start_media", stream_id: "browser-" + callSid, start: { voice_id: callSid } }));
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await audioCtx.resume();
+      srcNode = audioCtx.createMediaStreamSource(micStream);
+      micNode = audioCtx.createScriptProcessor(2048, 1, 1);
+      micNode.onaudioprocess = (ev) => pumpMic(ev.inputBuffer.getChannelData(0), audioCtx.sampleRate);
+      srcNode.connect(micNode);
+      micNode.connect(audioCtx.destination); // ScriptProcessor needs a sink; mic isn't audible (no loopback of output)
+      startedAt = Date.now();
+      durTimer = setInterval(() => {
+        const s = Math.floor((Date.now() - startedAt) / 1000);
+        $("mDur").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+      }, 1000);
+      setStatus("live", "Live — speak after the greeting");
+      $("endBtn").disabled = false;
+      $("applyBtn").disabled = false;
+      showBadges();
+      addMsg("sys", "Call started · " + JSON.stringify(providers()));
+    };
+    mediaWs.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.event === "media" && msg.media?.payload) playUlaw(msg.media.payload);
+      if (msg.event === "clear_media") flushPlayback(); // barge-in / preempt
+    };
+    mediaWs.onclose = () => { if (callSid) endCall(true); };
+    mediaWs.onerror = () => setStatus("", "Audio stream error");
+
+    // Live transcript WS
+    liveWs = new WebSocket(resp.live_url || (orch.replace(/^http/, "ws") + "/live/" + callSid));
+    liveWs.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "caller_transcript") addMsg("user", m.text, m.language || "");
+      if (m.type === "agent_reply") addMsg("agent", m.text);
+      if (m.type === "call_status" && m.status === "ended") addMsg("sys", "Call ended by agent");
+    };
+  }
+
+  function cleanup() {
+    if (durTimer) clearInterval(durTimer);
+    durTimer = null;
+    try { micNode?.disconnect(); srcNode?.disconnect(); } catch (_) {}
+    micStream?.getTracks().forEach(t => t.stop());
+    flushPlayback();
+    try { audioCtx?.close(); } catch (_) {}
+    audioCtx = micStream = micNode = srcNode = null;
+    try { liveWs?.close(); } catch (_) {}
+    liveWs = null;
+    seq = 0; sendCarry = new Float32Array(0);
+    $("startBtn").disabled = false;
+    $("endBtn").disabled = true;
+    $("applyBtn").disabled = true;
+    $("vu").firstElementChild.style.width = "0%";
+  }
+
+  function endCall(remote) {
+    if (!callSid) return;
+    if (!remote && mediaWs?.readyState === WebSocket.OPEN) {
+      try { mediaWs.send(JSON.stringify({ event: "stop_media" })); } catch (_) {}
+    }
+    try { mediaWs?.close(); } catch (_) {}
+    mediaWs = null; callSid = null;
+    cleanup();
+    setStatus("", "Call ended");
+    addMsg("sys", "Call ended");
+  }
+
+  async function applyProviders() {
+    if (!callSid) return;
+    const orch = $("orchUrl").value.trim().replace(/\/$/, "");
+    try {
+      const r = await fetch(orch + "/call/browser-test/" + callSid + "/providers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Internal-Token": $("token").value.trim() },
+        body: JSON.stringify(providers()),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+      showBadges();
+      addMsg("sys", "Providers switched → " + JSON.stringify(j.providers) + " (takes effect next reply)");
+    } catch (e) {
+      addMsg("sys", "Provider switch failed: " + e.message);
+    }
+  }
+
+  $("startBtn").addEventListener("click", startCall);
+  $("endBtn").addEventListener("click", () => endCall(false));
+  $("applyBtn").addEventListener("click", applyProviders);
+})();
+</script>
+</body>
+</html>
