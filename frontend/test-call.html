@@ -74,12 +74,14 @@
       <option value="deepgram">Deepgram nova-2 (streaming — lowest latency)</option>
       <option value="sarvam">Sarvam Saarika v2.5 (batch — best Hinglish)</option>
       <option value="elevenlabs">ElevenLabs Scribe (batch)</option>
+      <option value="gemini">Gemini 2.5 Flash (batch — audio transcription)</option>
     </select>
 
     <h2>Text-to-Speech (TTS)</h2>
     <select id="tts">
       <option value="elevenlabs">ElevenLabs (streaming)</option>
       <option value="sarvam">Sarvam Bulbul</option>
+      <option value="gemini">Gemini TTS</option>
     </select>
     <label>Voice</label>
     <select id="ttsVoice"></select>
@@ -91,6 +93,7 @@
     <select id="llm">
       <option value="openai">OpenAI (env model)</option>
       <option value="groq">Groq (fastest first token)</option>
+      <option value="gemini">Gemini 2.5 Flash</option>
     </select>
 
     <h2>Agent Setup</h2>
@@ -188,6 +191,28 @@
       models: [
         { id: "bulbul:v3", label: "Bulbul v3 (latest)" },
         { id: "bulbul:v2", label: "Bulbul v2" },
+      ],
+    },
+    // Gemini's prebuilt TTS voices — names + tonal descriptors from Google's own docs.
+    gemini: {
+      voices: [
+        { id: "Kore",      label: "Kore — Firm" },
+        { id: "Puck",      label: "Puck — Upbeat" },
+        { id: "Zephyr",    label: "Zephyr — Bright" },
+        { id: "Fenrir",    label: "Fenrir — Excitable" },
+        { id: "Leda",      label: "Leda — Youthful" },
+        { id: "Aoede",     label: "Aoede — Breezy" },
+        { id: "Callirrhoe",label: "Callirrhoe — Easy-going" },
+        { id: "Achird",    label: "Achird — Friendly" },
+        { id: "Sulafat",   label: "Sulafat — Warm" },
+        { id: "Despina",   label: "Despina — Smooth" },
+        { id: "Charon",    label: "Charon — Informative" },
+        { id: "Autonoe",   label: "Autonoe — Bright" },
+        { id: "__custom__", label: "Custom voice name…" },
+      ],
+      models: [
+        { id: "gemini-2.5-flash-preview-tts", label: "2.5 Flash TTS (faster)" },
+        { id: "gemini-2.5-pro-preview-tts",   label: "2.5 Pro TTS (higher quality)" },
       ],
     },
   };

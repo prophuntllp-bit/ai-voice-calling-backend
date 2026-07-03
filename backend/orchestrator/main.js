@@ -1037,6 +1037,43 @@ const SARVAM_LANG_MAP = {
   "mal": "ml-IN",
 };
 
+const GEMINI_LANG_NAMES = {
+  hi: "Hindi", en: "English", mr: "Marathi", ta: "Tamil", te: "Telugu",
+  kn: "Kannada", gu: "Gujarati", bn: "Bengali", pa: "Punjabi", ml: "Malayalam",
+};
+
+async function transcribeAudioGemini(audioBuffer, language = "auto") {
+  const wav = ensureWavBuffer(audioBuffer);
+  const langHint = GEMINI_LANG_NAMES[language]
+    ? ` The speaker is likely speaking ${GEMINI_LANG_NAMES[language]}, possibly mixed with English (Hinglish).`
+    : " The speaker may be speaking Hindi, English, Marathi, or a Hindi-English mix (Hinglish).";
+  const prompt = `Transcribe EXACTLY what is spoken in this audio clip. Output ONLY the transcript text in its `
+    + `original language/script — no translation, no explanation, no quotes, no labels.${langHint} `
+    + `If the audio is silent, noise, or unintelligible, output nothing.`;
+  const t0 = Date.now();
+  const response = await timed("stt_gemini", () =>
+    axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_STT_MODEL || "gemini-2.5-flash"}:generateContent`,
+      {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: "audio/wav", data: wav.toString("base64") } },
+          ],
+        }],
+        generationConfig: { temperature: 0, maxOutputTokens: 200 },
+      },
+      {
+        headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "Content-Type": "application/json" },
+        timeout: 12000,
+      }
+    )
+  );
+  const text = (response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+  console.log(`[stt-gemini] latency=${Date.now()-t0}ms text="${text.slice(0, 80)}"`);
+  return { text, language: language === "auto" ? "hi" : language };
+}
+
 async function transcribeAudioDirect(audioBuffer, language = "auto", providerOverride = null) {
   const elevenKey = process.env.ELEVENLABS_API_KEY;
   const sarvamKey = process.env.SARVAM_API_KEY;
@@ -1047,6 +1084,20 @@ async function transcribeAudioDirect(audioBuffer, language = "auto", providerOve
   // providerOverride (per-session, from browser test harness) takes precedence over env.
   const sttProvider = (providerOverride || process.env.STT_PROVIDER || "sarvam").toLowerCase();
   const useSarvamFirst = sttProvider === "sarvam" && !!sarvamKey;
+
+  // ── Gemini (multimodal audio-in transcription) — only when explicitly selected
+  // via provider override (browser test lab). Gemini has no dedicated streaming
+  // ASR endpoint like Sarvam/Deepgram; this sends the audio inline to generateContent
+  // and asks for an exact transcript back. Batch-only, so it won't beat streaming
+  // STT on latency, but it's a real bake-off entry for accuracy on Hindi/Hinglish. ──
+  if (sttProvider === "gemini" && process.env.GEMINI_API_KEY) {
+    const geminiResult = await transcribeAudioGemini(audioBuffer, language).catch((err) => {
+      console.warn("[stt-gemini] failed, falling back:", err.message);
+      return null;
+    });
+    if (geminiResult) return geminiResult;
+    // fall through to Sarvam/ElevenLabs below on failure
+  }
 
   // ── Sarvam Saarika v2.5 (primary when STT_PROVIDER=sarvam) ───────────────
   if (useSarvamFirst) {
@@ -1581,6 +1632,38 @@ async function getLLMResponse(session, userText) {
     ? session.providerOverrides.llm === "groq"
     : process.env.LLM_PREFER_GROQ === "true";
 
+  // ── Gemini (only when explicitly selected via provider override — e.g. the
+  // browser test lab's bake-off dropdown). Gemini's chat/completions endpoint
+  // is OpenAI-compatible, so it reuses the same collectStreamingReply parser. ──
+  if (session.providerOverrides?.llm === "gemini" && process.env.GEMINI_API_KEY) {
+    try {
+      const t0 = Date.now();
+      const response = await timed("gemini", () =>
+        axios.post(
+          "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+          {
+            model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+            messages,
+            temperature: 0.3,
+            max_tokens: 75,
+            stream: true,
+          },
+          { headers: { Authorization: `Bearer ${process.env.GEMINI_API_KEY}` }, responseType: "stream", timeout: 8000 }
+        )
+      );
+      const reply = stripFillerOpener(await collectStreamingReply(response));
+      console.log(`[gemini] callSid=${session.callSid} latency=${Date.now()-t0}ms reply="${reply.slice(0,60)}"`);
+      session.history.push({ role: "assistant", content: reply });
+      const match = reply.match(/OUTCOME:({.*})/s);
+      if (match) { try { session.outcome = JSON.parse(match[1]); } catch {} }
+      return reply.replace(/OUTCOME:({.*})/s, "").trim();
+    } catch (err) {
+      const statusCode = err.response?.status;
+      const errBody = safeErrBody(err.response?.data);
+      console.warn(`[gemini] failed (HTTP ${statusCode || "?"}) falling back to OpenAI/Groq: ${err.message} — ${errBody}`);
+    }
+  }
+
   // ── OpenAI (primary unless preferGroq=true) ───────────────────────────────
   if (process.env.OPENAI_API_KEY && !preferGroq) {
     try {
@@ -2063,6 +2146,53 @@ async function synthesizeSpeechSarvam(text, voiceId, lang, modelOverride = null)
   }
 }
 
+// Gemini native TTS — generateContent with responseModalities:["AUDIO"] returns
+// raw PCM (24kHz, 16-bit, mono) as base64, which we wrap in a WAV header so the
+// rest of the pipeline (resamplePcm16, toEnablexMuLawChunks) handles it uniformly.
+const GEMINI_TTS_SAMPLE_RATE = 24000;
+async function synthesizeSpeechGemini(text, voiceName, emotion) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  const t0 = Date.now();
+  // Gemini TTS takes style instructions as natural language rather than numeric
+  // sliders — prepend a short tone cue so emotion actually affects the delivery.
+  const toneCue = {
+    warm: "Say this warmly and welcomingly: ",
+    excited: "Say this with genuine enthusiasm and energy: ",
+    empathetic: "Say this gently and reassuringly: ",
+    professional: "Say this clearly and confidently: ",
+  }[emotion] || "Say this naturally, in a warm conversational tone: ";
+  try {
+    const response = await timed("tts_gemini", () =>
+      axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts"}:generateContent`,
+        {
+          contents: [{ parts: [{ text: toneCue + text }] }],
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || "Kore" } },
+            },
+          },
+        },
+        {
+          headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "Content-Type": "application/json" },
+          timeout: parseInt(process.env.TTS_REQUEST_TIMEOUT_MS || "20000", 10),
+        }
+      )
+    );
+    const part = response.data?.candidates?.[0]?.content?.parts?.[0];
+    const b64 = part?.inlineData?.data || part?.inline_data?.data;
+    if (!b64) return null;
+    const pcm = Buffer.from(b64, "base64");
+    console.log(`[tts-gemini] latency=${Date.now()-t0}ms voice=${voiceName || "Kore"}`);
+    return createWavBuffer(pcm, GEMINI_TTS_SAMPLE_RATE);
+  } catch (err) {
+    const body = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : "";
+    console.warn(`[tts-gemini] failed (${Date.now()-t0}ms): ${err.message}${body ? " body=" + body : ""}`);
+    return null;
+  }
+}
+
 async function synthesizeSpeech(session, text) {
   const normalizedText = normalizeTtsText(text);
   // gender: from campaign (set by dashboard voice selection) → lead → default female
@@ -2098,8 +2228,17 @@ async function synthesizeSpeech(session, text) {
     console.warn("[tts] Sarvam failed, falling back to microservice");
   }
 
-  // ── Microservice fallback (handles ElevenLabs or local TTS) ──────────────
   const emotion = emotionFromContext(text, { stage: session.stage });
+
+  // ── Gemini TTS (only when explicitly selected via provider override) ─────
+  if (ttsProvider === "gemini") {
+    const geminiVoice = session.providerOverrides?.ttsVoice || "Kore";
+    const audio = await synthesizeSpeechGemini(normalizedText, geminiVoice, emotion);
+    if (audio) return audio;
+    console.warn("[tts] Gemini failed, falling back to microservice");
+  }
+
+  // ── Microservice fallback (handles ElevenLabs or local TTS) ──────────────
   try {
     const response = await timed("tts", () =>
       axios.post(
@@ -2845,14 +2984,17 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
   const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
 
   // LLM selection — per-session override > LLM_PREFER_GROQ env > OpenAI default.
-  // Groq's chat/completions API is OpenAI-compatible so the same SSE parser works.
-  const llmPref = session.providerOverrides?.llm
+  // Groq's and Gemini's chat/completions endpoints are both OpenAI-compatible,
+  // so the exact same SSE parser below works for all three providers unchanged.
+  const llmPref  = session.providerOverrides?.llm
     || (process.env.LLM_PREFER_GROQ === "true" ? "groq" : "openai");
-  const useGroq  = llmPref === "groq" && !!process.env.GROQ_API_KEY;
-  const llmUrl   = useGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
-  const llmKey   = useGroq ? process.env.GROQ_API_KEY : openaiKey;
-  const llmModel = useGroq
-    ? (process.env.GROQ_MODEL || "llama-3.3-70b-versatile")
+  const useGroq   = llmPref === "groq"   && !!process.env.GROQ_API_KEY;
+  const useGemini = llmPref === "gemini" && !!process.env.GEMINI_API_KEY;
+  const llmUrl   = useGemini ? "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    : useGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+  const llmKey   = useGemini ? process.env.GEMINI_API_KEY : useGroq ? process.env.GROQ_API_KEY : openaiKey;
+  const llmModel = useGemini ? (process.env.GEMINI_MODEL || "gemini-2.5-flash")
+    : useGroq ? (process.env.GROQ_MODEL || "llama-3.3-70b-versatile")
     : (process.env.OPENAI_MODEL || "gpt-4.1");
   if (!elevenKey || !llmKey || ttsProvider !== "elevenlabs") return null;
 
@@ -3114,11 +3256,24 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
 //
 // Returns: full reply string on success  |  null → caller falls back to getLLMResponse
 async function streamingLLMWithLocalTTS(ws, session, userText) {
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) return null;
   // Only used when ElevenLabs is not the TTS provider (per-session override aware)
   const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
   if (ttsProvider === "elevenlabs" && process.env.ELEVENLABS_API_KEY) return null;
+
+  // LLM selection — same override pattern as streamingLLMWithElevenLabs. All three
+  // providers expose an OpenAI-compatible chat/completions endpoint, so the SSE
+  // parser below is shared unchanged.
+  const llmPref   = session.providerOverrides?.llm
+    || (process.env.LLM_PREFER_GROQ === "true" ? "groq" : "openai");
+  const useGroq   = llmPref === "groq"   && !!process.env.GROQ_API_KEY;
+  const useGemini = llmPref === "gemini" && !!process.env.GEMINI_API_KEY;
+  const llmUrl    = useGemini ? "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    : useGroq ? "https://api.groq.com/openai/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+  const llmKey    = useGemini ? process.env.GEMINI_API_KEY : useGroq ? process.env.GROQ_API_KEY : process.env.OPENAI_API_KEY;
+  const llmModel  = useGemini ? (process.env.GEMINI_MODEL || "gemini-2.5-flash")
+    : useGroq ? (process.env.GROQ_MODEL || "llama-3.3-70b-versatile")
+    : (process.env.OPENAI_MODEL || "gpt-4.1");
+  if (!llmKey) return null;
 
   const callSid = session.callSid;
   const maxWords = parseInt(process.env.TTS_MAX_WORDS || "18", 10);
@@ -3207,9 +3362,9 @@ async function streamingLLMWithLocalTTS(ws, session, userText) {
 
   try {
     const llmResp = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      { model: process.env.OPENAI_MODEL || "gpt-4.1", messages, temperature: 0.4, max_tokens: 70, stream: true },
-      { headers: { Authorization: `Bearer ${openaiKey}` }, responseType: "stream", timeout: 8000 }
+      llmUrl,
+      { model: llmModel, messages, temperature: 0.4, max_tokens: 70, stream: true },
+      { headers: { Authorization: `Bearer ${llmKey}` }, responseType: "stream", timeout: 8000 }
     );
 
     await new Promise((resolve, reject) => {
@@ -4506,9 +4661,9 @@ app.post("/call/bulk-dial", requireToken, async (req, res) => {
 // instead of EnableX. Providers are switchable per session AND mid-call, so
 // STT/TTS/LLM engines can be A/B tested by ear without spending telephony minutes.
 const BROWSER_TEST_PROVIDERS = {
-  stt: new Set(["deepgram", "sarvam", "elevenlabs"]),
-  tts: new Set(["elevenlabs", "sarvam"]),
-  llm: new Set(["openai", "groq"]),
+  stt: new Set(["deepgram", "sarvam", "elevenlabs", "gemini"]),
+  tts: new Set(["elevenlabs", "sarvam", "gemini"]),
+  llm: new Set(["openai", "groq", "gemini"]),
 };
 
 function sanitizeProviderOverrides(input = {}) {
