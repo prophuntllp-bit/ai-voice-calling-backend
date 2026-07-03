@@ -2238,7 +2238,11 @@ async function synthesizeSpeech(session, text) {
   // because ElevenLabs voice IDs are case-sensitive; Sarvam speakers are lowercase anyway.
   if (session.providerOverrides?.ttsVoice) voiceId = session.providerOverrides.ttsVoice;
 
-  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+  // Default flipped to Sarvam — ElevenLabs account is out of quota (confirmed via
+  // the tts-service's own /test-elevenlabs diagnostic: "quota_exceeded, 0 credits
+  // remaining"). Sarvam is the working alternative already wired into every TTS
+  // path. Set TTS_PROVIDER=elevenlabs explicitly once quota is restored to switch back.
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "sarvam").toLowerCase();
 
   // ── Sarvam Bulbul TTS (primary when TTS_PROVIDER=sarvam, default) ─────────
   if (ttsProvider === "sarvam" || ttsProvider === "bulbul") {
@@ -3014,7 +3018,11 @@ function createMulawStreamQueue(ws, session, label = "stream") {
 async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio } = {}) {
   const elevenKey = process.env.ELEVENLABS_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
-  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+  // Default flipped to Sarvam — ElevenLabs account is out of quota (confirmed via
+  // the tts-service's own /test-elevenlabs diagnostic: "quota_exceeded, 0 credits
+  // remaining"). Sarvam is the working alternative already wired into every TTS
+  // path. Set TTS_PROVIDER=elevenlabs explicitly once quota is restored to switch back.
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "sarvam").toLowerCase();
 
   // LLM selection — per-session override > LLM_PREFER_GROQ env > OpenAI default.
   // Groq's and Gemini's chat/completions endpoints are both OpenAI-compatible,
@@ -3290,7 +3298,11 @@ async function streamingLLMWithElevenLabs(ws, session, userText, { onFirstAudio 
 // Returns: full reply string on success  |  null → caller falls back to getLLMResponse
 async function streamingLLMWithLocalTTS(ws, session, userText) {
   // Only used when ElevenLabs is not the TTS provider (per-session override aware)
-  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "elevenlabs").toLowerCase();
+  // Default flipped to Sarvam — ElevenLabs account is out of quota (confirmed via
+  // the tts-service's own /test-elevenlabs diagnostic: "quota_exceeded, 0 credits
+  // remaining"). Sarvam is the working alternative already wired into every TTS
+  // path. Set TTS_PROVIDER=elevenlabs explicitly once quota is restored to switch back.
+  const ttsProvider = (session.providerOverrides?.tts || process.env.TTS_PROVIDER || "sarvam").toLowerCase();
   if (ttsProvider === "elevenlabs" && process.env.ELEVENLABS_API_KEY) return null;
 
   // LLM selection — same override pattern as streamingLLMWithElevenLabs. All three
