@@ -2193,6 +2193,26 @@ async function synthesizeSpeechGemini(text, voiceName, emotion) {
   }
 }
 
+// ── Circuit breaker for the TTS microservice fallback ────────────────────────
+// Module-level (not per-session) because the underlying cause — a bad API key
+// or an exhausted account-wide rate limit — affects every concurrent call, not
+// just one. Without this, a single misconfigured credential caused every
+// filler/greeting/nudge/goodbye call across every active session to keep
+// retrying a guaranteed-to-fail endpoint with zero backoff.
+let ttsMicroserviceCooldownUntil  = 0;
+let ttsMicroserviceCooldownReason = "";
+function ttsMicroserviceOnCooldown() {
+  return Date.now() < ttsMicroserviceCooldownUntil;
+}
+function tripTtsMicroserviceCircuitBreaker(status) {
+  // 401/403 = the credential itself is wrong — won't self-heal, so cool down
+  // longer. 429 = rate limit, likely to reset soon — shorter cooldown.
+  const cooldownMs = (status === 401 || status === 403) ? 120000 : 15000;
+  ttsMicroserviceCooldownUntil  = Date.now() + cooldownMs;
+  ttsMicroserviceCooldownReason = `HTTP ${status}`;
+  console.warn(`[tts] circuit breaker OPEN for ${cooldownMs}ms (reason: HTTP ${status}) — skipping microservice fallback calls until cooldown expires`);
+}
+
 async function synthesizeSpeech(session, text) {
   const normalizedText = normalizeTtsText(text);
   // gender: from campaign (set by dashboard voice selection) → lead → default female
@@ -2239,6 +2259,10 @@ async function synthesizeSpeech(session, text) {
   }
 
   // ── Microservice fallback (handles ElevenLabs or local TTS) ──────────────
+  if (ttsMicroserviceOnCooldown()) {
+    console.warn(`[tts] microservice on cooldown (${ttsMicroserviceCooldownReason}) — skipping call callSid=${session.callSid}`);
+    return null;
+  }
   try {
     const response = await timed("tts", () =>
       axios.post(
@@ -2256,13 +2280,22 @@ async function synthesizeSpeech(session, text) {
     );
     return Buffer.from(response.data);
   } catch (error) {
+    const status = error.response?.status;
     console.warn("[tts] microservice synthesis failed", {
       callSid: session.callSid,
       voiceId,
       language,
       message: error.message,
-      status: error.response?.status,
+      status,
     });
+    // 401/403 = the credential is wrong and will NOT self-heal on retry; 429 = rate
+    // limited. Retrying either on every single filler/greeting/nudge call across
+    // every session (as before) hammered a guaranteed-to-fail endpoint hundreds of
+    // times per second and stalled real turns for a minute-plus. Trip a cooldown
+    // so subsequent calls fail fast instead of piling up.
+    if (status === 401 || status === 403 || status === 429) {
+      tripTtsMicroserviceCircuitBreaker(status);
+    }
     return null;
   }
 }
